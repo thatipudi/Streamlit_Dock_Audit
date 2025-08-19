@@ -1,16 +1,17 @@
-# Dock_audit.py — Infinitum Dock Audit: Form + Live Dashboard (Google Sheets-first)
+# Dock_audit.py — Infinitum Dock Audit: Form + Live Dashboard (Google Sheets ONLY)
 
 import os
-import io
-import time
 import base64
 from datetime import datetime, date as date_cls
 
 import streamlit as st
 import pandas as pd
 import altair as alt
-from gspread_dataframe import get_as_dataframe, set_with_dataframe
 
+# Sheets libs
+import gspread
+from google.oauth2.service_account import Credentials
+from gspread_dataframe import get_as_dataframe, set_with_dataframe
 
 
 # -------------------- PAGE --------------------
@@ -36,19 +37,17 @@ st.markdown("""
   .inf-title { color:#fff; font-weight:800; font-size:1.9rem; margin:0; }
   .inf-sub { color:#D7E2EC; font-size:1.05rem; margin:4px 0 0 0; }
   .stTextInput>div>div>input, .stTextArea textarea, .stSelectbox>div>div { border-radius: 10px !important; }
-  .sticky-bar{ position: sticky; bottom: 10px; z-index: 50;
+  .sticky-bar{
+    position: sticky; bottom: 10px; z-index: 50;
     background: rgba(16,24,40,0.35); backdrop-filter: blur(6px);
-    border: 1px solid rgba(255,255,255,0.08); border-radius: 12px; padding: 10px 12px; margin-top: 6px; }
+    border: 1px solid rgba(255,255,255,0.08); border-radius: 12px; padding: 10px 12px; margin-top: 6px;
+  }
 </style>
 """, unsafe_allow_html=True)
 
-# -------------------- PATHS (fallback for local runs) --------------------
-DATA_DIR  = "."
-CSV_PATH  = os.path.join(DATA_DIR, "dock_audit_entries.csv")
-XLSX_PATH = os.path.join(DATA_DIR, "dock_audit_entries.xlsx")
+# -------------------- LOGO HEADER --------------------
 LOGO_FILE = "Infinitum Logo.png"
 
-# -------------------- HEADER --------------------
 def render_header(logo_path: str = LOGO_FILE,
                   title: str = "Dock Audit Dashboard",
                   subtitle: str = "Infinitum Electric"):
@@ -110,7 +109,7 @@ DEFECT_DICT = {
     "F03": "F03 - Hipot reject",
 }
 
-# -------------------- HELPERS --------------------
+# -------------------- UTIL --------------------
 def normalize_cols(df: pd.DataFrame) -> pd.DataFrame:
     if df is None or (df.empty and df.columns.size == 0):
         return df
@@ -135,7 +134,6 @@ def code_from_label(lbl: str) -> str:
     return s.split(" - ")[0] if " - " in s else s
 
 def is_duplicate(df: pd.DataFrame, serial: str, dt) -> bool:
-    """Block duplicate Serial Number + Date entries."""
     if df is None or df.empty:
         return False
     if "serial number" not in df.columns or "date" not in df.columns:
@@ -149,104 +147,52 @@ def is_duplicate(df: pd.DataFrame, serial: str, dt) -> bool:
     except Exception:
         return False
 
-# -------------------- STORAGE LAYER --------------------
-# Use your exact secrets section name:
-USE_SHEETS = ("google_service_account" in st.secrets) and ("SHEETS" in st.secrets)
+# -------------------- GOOGLE SHEETS LAYER (required) --------------------
+if not (("google_service_account" in st.secrets) and ("SHEETS" in st.secrets)):
+    st.error("Missing secrets. Please add [google_service_account] and [SHEETS] to secrets.toml.")
+    st.stop()
 
-if USE_SHEETS:
-    import gspread
-    from google.oauth2.service_account import Credentials
-    from gspread_dataframe import get_as_dataframe, set_with_dataframe
+def _get_gs_client():
+    creds_info = dict(st.secrets["google_service_account"])
+    # Convert literal '\n' in the pasted key to real newlines:
+    if "private_key" in creds_info:
+        creds_info["private_key"] = creds_info["private_key"].replace("\\n", "\n")
+    scopes = ["https://www.googleapis.com/auth/spreadsheets"]
+    creds = Credentials.from_service_account_info(creds_info, scopes=scopes)
+    return gspread.authorize(creds)
 
-    def _get_gs_client():
-        creds_info = dict(st.secrets["google_service_account"])
-        # If your private_key was pasted with literal \n characters, uncomment:
-        # creds_info["private_key"] = creds_info["private_key"].replace("\\n", "\n")
-        scopes = ["https://www.googleapis.com/auth/spreadsheets"]
-        creds = Credentials.from_service_account_info(creds_info, scopes=scopes)
-        return gspread.authorize(creds)
+def _open_sheet():
+    client = _get_gs_client()
+    sheet_id = st.secrets["SHEETS"]["SHEET_ID"]
+    tab = st.secrets["SHEETS"]["TAB_NAME"]
+    sh = client.open_by_key(sheet_id)
+    ws = sh.worksheet(tab)
+    return ws
 
-    def _open_sheet():
-        client = _get_gs_client()
-        sheet_id = st.secrets["SHEETS"]["SHEET_ID"]
-        tab = st.secrets["SHEETS"]["TAB_NAME"]
-        sh = client.open_by_key(sheet_id)
-        ws = sh.worksheet(tab)
-        return ws
+@st.cache_data(show_spinner=False)
+def load_data() -> pd.DataFrame:
+    ws = _open_sheet()
+    df = get_as_dataframe(ws, header=0, evaluate_formulas=True).dropna(how="all")
+    if df.empty:
+        return ensure_canon_columns(pd.DataFrame(columns=CANON))
+    df = ensure_canon_columns(df)
+    df["result"] = df["result"].apply(result_norm)
+    df["date"] = pd.to_datetime(df["date"], errors="coerce")
+    return df
 
-    @st.cache_data(show_spinner=False)
-    def load_data() -> pd.DataFrame:
-        try:
-            ws = _open_sheet()
-            df = get_as_dataframe(ws, header=0, evaluate_formulas=True).dropna(how="all")
-            if df.empty:
-                return ensure_canon_columns(pd.DataFrame(columns=CANON))
-            df = ensure_canon_columns(df)
-            df["result"] = df["result"].apply(result_norm)
-            df["date"] = pd.to_datetime(df["date"], errors="coerce")
-            return df
-        except Exception as e:
-            st.warning(f"Could not read Google Sheet: {e}")
-            return ensure_canon_columns(pd.DataFrame(columns=CANON))
-
-    def append_and_save(entry_df: pd.DataFrame):
-        ws = _open_sheet()
-        current = get_as_dataframe(ws, header=0, evaluate_formulas=True).dropna(how="all")
-        if current.empty:
-            out = entry_df.copy()
-        else:
-            current = ensure_canon_columns(current)
-            out = pd.concat([current, entry_df], ignore_index=True)
-
-        out2 = out.copy()
-        out2.columns = CANON_TITLE
-        ws.clear()
-        set_with_dataframe(ws, out2, include_index=False, include_column_header=True)
-
-else:
-    # Excel/CSV fallback
-    @st.cache_data(show_spinner=False)
-    def load_data() -> pd.DataFrame:
-        if os.path.exists(XLSX_PATH):
-            df = pd.read_excel(XLSX_PATH)
-        elif os.path.exists(CSV_PATH):
-            df = pd.read_csv(CSV_PATH)
-        else:
-            return ensure_canon_columns(pd.DataFrame(columns=CANON))
-        df = ensure_canon_columns(df)
-        df["result"] = df["result"].apply(result_norm)
-        df["date"] = pd.to_datetime(df["date"], errors="coerce")
-        return df
-
-    def append_and_save(entry_df: pd.DataFrame):
-        try:
-            csv_header = not os.path.exists(CSV_PATH)
-            entry_df.to_csv(CSV_PATH, mode="a", header=csv_header, index=False)
-        except Exception:
-            pass
-
-        if os.path.exists(XLSX_PATH):
-            try:
-                existing = pd.read_excel(XLSX_PATH)
-                existing = ensure_canon_columns(existing)
-                out = pd.concat([existing, entry_df], ignore_index=True)
-            except Exception:
-                out = ensure_canon_columns(entry_df)
-        else:
-            out = ensure_canon_columns(entry_df)
-
-        out.columns = CANON_TITLE
-        last_err = None
-        for _ in range(4):
-            try:
-                out.to_excel(XLSX_PATH, index=False)
-                last_err = None
-                break
-            except PermissionError as e:
-                last_err = e
-                time.sleep(0.6)
-        if last_err:
-            raise last_err
+def append_and_save(entry_df: pd.DataFrame):
+    ws = _open_sheet()
+    current = get_as_dataframe(ws, header=0, evaluate_formulas=True).dropna(how="all")
+    if current.empty:
+        out = entry_df.copy()
+    else:
+        current = ensure_canon_columns(current)
+        out = pd.concat([current, entry_df], ignore_index=True)
+    # Write back with pretty headers:
+    out2 = out.copy()
+    out2.columns = CANON_TITLE
+    ws.clear()
+    set_with_dataframe(ws, out2, include_index=False, include_column_header=True, resize=True)
 
 # -------------------- FORM --------------------
 defect_options = list(DEFECT_DICT.values())
@@ -350,7 +296,7 @@ if not df.empty:
     if f_linea and "linea" in df.columns:
         df = df[df["linea"].isin(f_linea)]
     if f_sku and "sku" in df.columns:
-        df = df[df["sku"].isin(f_sku)]
+        df = df[df["sku"].isins(f_sku)]
     if f_res and "result" in df.columns:
         df = df[df["result"].isin(f_res)]
 
@@ -454,8 +400,6 @@ else:
             g4.altair_chart(bar_def, use_container_width=True)
         else:
             g4.info("No defect code data yet.")
-    else:
-        g4.info("Defect Code column not found.")
 
     st.markdown("#### Monthly Audit Trend by Status")
     if "result" in work.columns:
@@ -484,12 +428,7 @@ else:
         use_container_width=True
     )
 
-    # Download current dataset as Excel (in-memory; works on Cloud)
-    pretty = work.copy()
-    pretty.columns = [c.title() if c in CANON else c for c in pretty.columns]
-    buf = io.BytesIO()
-    with pd.ExcelWriter(buf, engine="openpyxl") as writer:
-        pretty.to_excel(writer, index=False, sheet_name="DockAudit")
-    st.download_button("⬇️ Download Excel", data=buf.getvalue(),
-                       file_name="dock_audit_entries.xlsx",
-                       mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+    # CSV download (Sheets-only)
+    csv_bytes = work.to_csv(index=False).encode("utf-8")
+    st.download_button("⬇️ Download CSV", data=csv_bytes,
+                       file_name="dock_audit_entries.csv", mime="text/csv")
