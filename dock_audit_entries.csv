@@ -1,0 +1,2 @@
+event dock audit,linea,wo,sku,date,serial number,result,finding,defect code,specific issue,classification,comments
+Audit,Line A,901,SKU12345,2025-08-19,234567,Pass,VFD,M02,VFD,Minor,VFD
