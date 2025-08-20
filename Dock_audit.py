@@ -152,9 +152,21 @@ if not (("google_service_account" in st.secrets) and ("SHEETS" in st.secrets)):
     st.error("Missing secrets. Please add [google_service_account] and [SHEETS] to secrets.toml.")
     st.stop()
 
+def _extract_sheet_key(sheet_id_or_url: str) -> str:
+    """Accepts either a pure spreadsheet key or a full URL and returns the key."""
+    text = str(sheet_id_or_url).strip()
+    if "/d/" in text:
+        # Full URL -> split out the key between /d/ and the next /
+        try:
+            return text.split("/d/")[1].split("/")[0]
+        except Exception:
+            pass
+    return text
+
+@st.cache_resource(show_spinner=False)
 def _get_gs_client():
     creds_info = dict(st.secrets["google_service_account"])
-    # Convert literal '\n' in the pasted key to real newlines:
+    # Convert literal '\n' to real newlines if needed
     if "private_key" in creds_info:
         creds_info["private_key"] = creds_info["private_key"].replace("\\n", "\n")
     scopes = ["https://www.googleapis.com/auth/spreadsheets"]
@@ -163,9 +175,10 @@ def _get_gs_client():
 
 def _open_sheet():
     client = _get_gs_client()
-    sheet_id = st.secrets["SHEETS"]["SHEET_ID"]
+    sheet_id_raw = st.secrets["SHEETS"]["SHEET_ID"]
+    sheet_key = _extract_sheet_key(sheet_id_raw)
     tab = st.secrets["SHEETS"]["TAB_NAME"]
-    sh = client.open_by_key(sheet_id)
+    sh = client.open_by_key(sheet_key)
     ws = sh.worksheet(tab)
     return ws
 
@@ -296,7 +309,7 @@ if not df.empty:
     if f_linea and "linea" in df.columns:
         df = df[df["linea"].isin(f_linea)]
     if f_sku and "sku" in df.columns:
-        df = df[df["sku"].isins(f_sku)]
+        df = df[df["sku"].isin(f_sku)]   # <-- fixed here
     if f_res and "result" in df.columns:
         df = df[df["result"].isin(f_res)]
 
@@ -432,3 +445,4 @@ else:
     csv_bytes = work.to_csv(index=False).encode("utf-8")
     st.download_button("⬇️ Download CSV", data=csv_bytes,
                        file_name="dock_audit_entries.csv", mime="text/csv")
+
